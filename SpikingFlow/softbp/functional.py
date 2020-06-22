@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import SpikingFlow.softbp.neuron as neuron
 
 def spike_cluster(v: torch.Tensor, v_threshold, T_in: int):
     '''
@@ -119,14 +120,14 @@ def spike_cluster(v: torch.Tensor, v_threshold, T_in: int):
 
         return N_o, k_positive, k_negative
 
-def spike_similar_loss(spikes:torch.Tensor, labels:torch.Tensor, sim_type='strict', loss_type='mse'):
+def spike_similar_loss(spikes:torch.Tensor, labels:torch.Tensor, kernel_type='linear', loss_type='mse', *args):
     '''
     :param spikes: shape=[N, M, T]，N个数据生成的脉冲
     :param labels: shape=[N, C]，N个数据的标签，labels[i][k] == 1表示数据i属于第k类，labels[i][k] == 0则表示数据i不属于第k类，允许多标签
-    :param sim_type: 如何定义脉冲的“相似”，可以为'strict'或'relaxed'
+    :param kernel_type: 使用内积来衡量两个脉冲之间的相似性，kernel_type是计算内积时，所使用的核函数种类
     :param loss_type: 返回哪种损失，可以为'mse', 'l1', 'bce'
-    :return:
-    shape=[1]的tensor，相似损失
+    :param args: 用于计算内积的额外参数
+    :return: shape=[1]的tensor，相似损失
 
     将N个数据输入到输出层有M个神经元的SNN，运行T步，得到shape=[N, M, T]的脉冲。这N个数据的标签为shape=[N, C]的labels。
 
@@ -135,24 +136,17 @@ def spike_similar_loss(spikes:torch.Tensor, labels:torch.Tensor, sim_type='stric
 
     用shape=[N, N]的矩阵sim_p表示脉冲相似矩阵，sim_p[i][j]的取值为0到1，值越大表示数据i与数据j的脉冲越相似。
 
-    当sim_type == 'strict'时，数据i的脉冲 :math:`s_{i}` 和数据j的脉冲 :math:`s_{j}` 的相似度计算按照
+    使用内积来衡量两个脉冲之间的相似性，kernel_type是计算内积时，所使用的核函数种类。
 
-    .. math::
-        sim_{p_{ij}} = \\frac{1}{2}(\\frac{\\sum_{m=0}^{M-1} \\sum_{t=0}^{T-1}(2s_{i,m,t} - 1)(2s_{j,m,t} - 1)}{MT} + 1)
+    kernel_type == 'linear'，线性内积，:math:`\\kappa(\\boldsymbol{x_{i}}, \\boldsymbol{y_{j}}) = \\boldsymbol{x_{i}}^{T}\\boldsymbol{y_{j}}`。
 
-    当sim_type == 'relaxed'时，数据i的脉冲 :math:`s_{i}` 和数据j的脉冲 :math:`s_{j}` 的相似度计算按照
+    kernel_type == 'sigmoid'，sigmoid内积，:math:`\\kappa(\\boldsymbol{x_{i}}, \\boldsymbol{y_{j}}) = \\mathrm{sigmoid}(\\alpha \\boldsymbol{x_{i}}^{T}\\boldsymbol{y_{j}})`，其中 :math:`\\alpha = args[0]`。
 
-    .. math::
-        sim_{p_{ij}} = \\frac{\\sum_{m=0}^{M-1} \\sum_{t=0}^{T-1}s_{i,m,t}s_{j,m,t}}{\\sqrt{|s_{i}||s_{j}|} + \\epsilon}
+    kernel_type == 'gaussian'，高斯内积，:math:`\\kappa(\\boldsymbol{x_{i}}, \\boldsymbol{y_{j}}) = \\mathrm{exp}(- \\frac{||\\boldsymbol{x_{i}} - \\boldsymbol{y_{j}}||^{2}}{2\\sigma^{2}})`，其中 :math:`\\sigma = args[0]`。
 
-    其中 :math:`\\epsilon` 是一个很小的正数，可以为1e-6，防止出现除以0导致的数值不稳定。
+    当使用sigmoid或高斯内积时，内积的取值范围均在[0, 1]之间；而使用线性内积时，为了保证内积取值仍然在[0, 1]之间，会进行归一化：\\
+    按照sim_p[i][j] = :math:`\\frac{\\kappa(\\boldsymbol{x_{i}}, \\boldsymbol{y_{j}})}{||\\boldsymbol{x_{i}}|| · ||\\boldsymbol{y_{j}}||}`。
 
-    .. note::
-        将脉冲看作是一维的向量。
-
-        'strict'其实是将脉冲从0,1线性变换到-1,1，然后求解两个脉冲向量的夹角余弦值。再将取值范围为[-1,1]的余弦值线性变换到[0,1]。
-
-        'relaxed'是直接求解两个脉冲向量的夹角余弦值，由于脉冲向量的元素都为0或1，因此不会出现负余弦值，求解出的余弦值范围均为[0,1]。
 
     对于相似的数据，根据输入的loss_type，返回度量sim与sim_p差异的损失。
 
@@ -162,20 +156,19 @@ def spike_similar_loss(spikes:torch.Tensor, labels:torch.Tensor, sim_type='stric
 
     loss_type == 'bce'时，返回sim与sim_p的二值交叉熵误差。
 
+    .. note::
+        脉冲向量稀疏、离散，最好先使用高斯核进行平滑，然后再计算相似度。
+
     '''
 
     spikes = spikes.flatten(start_dim=1)
-    if sim_type == 'strict':
-        spikes = spikes * 2 - 1  # 0 1变换到-1 1
-        sim_p = spikes.mm(spikes.t()) / spikes.shape[1]
-        # shape=[N, N] sim[i][j]表示i与j的输出脉冲乘积，可以表示相似度。1表示完全相同，-1表示完全不相同
-        # / spikes.shape[1]是为了归一化
-        sim_p = (sim_p + 1) / 2  # -1 1变换到0 1
-    elif sim_type == 'relaxed':
-        spikes_norm2 = spikes.norm(dim=1, keepdim=True)  # shape=[N, 1]，表示N个脉冲的2范数（向量的长度）
-        sim_p = spikes.mm(spikes.t()) / (spikes_norm2.mm(spikes_norm2.t()) + 1e-6)  # + 1e-6防止出现除以0
-    else:
-        raise NotImplementedError
+
+    sim_p = kernel_dot_product(spikes, spikes, kernel_type, *args)
+
+    if kernel_type == 'linear':
+        spikes_len = spikes.norm(p=2, dim=1, keepdim=True)
+        sim_p = sim_p / ((spikes_len.mm(spikes_len.t())) + 1e-8)
+
 
     labels = labels.float()
     sim = labels.mm(labels.t()).clamp_max(1)  # labels.mm(labels.t())[i][j]位置的元素表现输入数据i和数据数据j有多少个相同的标签
@@ -189,3 +182,136 @@ def spike_similar_loss(spikes:torch.Tensor, labels:torch.Tensor, sim_type='stric
         return F.binary_cross_entropy(sim_p, sim)
     else:
         raise NotImplementedError
+
+def kernel_dot_product(x:torch.Tensor, y:torch.Tensor, kernel='linear', *args):
+
+    '''
+    :param x: shape=[N, M]的tensor，看作是N个M维向量
+    :param y: shape=[N, M]的tensor，看作是N个M维向量
+    :param kernel: 计算内积时所使用的核函数
+    :param args: 用于计算内积的额外的参数
+    :return: ret, shape=[N. N]的tensor，ret[i][j]表示x[i]和y[j]的内积
+
+    计算批量数据x和y在核空间的内积。记2个M维tensor分别为 :math:`\\boldsymbol{x_{i}}` 和 :math:`\\boldsymbol{y_{j}}`，则
+
+    kernel == 'linear'，线性内积，:math:`\\kappa(\\boldsymbol{x_{i}}, \\boldsymbol{y_{j}}) = \\boldsymbol{x_{i}}^{T}\\boldsymbol{y_{j}}`。
+
+    kernel == 'polynomial'，多项式内积，:math:`\\kappa(\\boldsymbol{x_{i}}, \\boldsymbol{y_{j}}) = (\\boldsymbol{x_{i}}^{T}\\boldsymbol{y_{j}})^{d}`，其中 :math:`d = args[0]`。
+
+    kernel == 'sigmoid'，sigmoid内积，:math:`\\kappa(\\boldsymbol{x_{i}}, \\boldsymbol{y_{j}}) = \\mathrm{sigmoid}(\\alpha \\boldsymbol{x_{i}}^{T}\\boldsymbol{y_{j}})`，其中 :math:`\\alpha = args[0]`。
+
+    kernel == 'gaussian'，高斯内积，:math:`\\kappa(\\boldsymbol{x_{i}}, \\boldsymbol{y_{j}}) = \\mathrm{exp}(- \\frac{||\\boldsymbol{x_{i}} - \\boldsymbol{y_{j}}||^{2}}{2\\sigma^{2}})`，其中 :math:`\\sigma = args[0]`。
+
+    '''
+    if kernel == 'linear':
+        return x.mm(y.t())
+    elif kernel == 'polynomial':
+        d = args[0]
+        return x.mm(y.t()).pow(d)
+    elif kernel == 'sigmoid':
+        alpha = args[0]
+        return torch.sigmoid(alpha * x.mm(y.t()))
+    elif kernel == 'gaussian':
+        sigma = args[0]
+        N = x.shape[0]
+        x2 = x.pow(2).sum(dim=1)  # shape=[N]
+        y2 = y.pow(2).sum(dim=1)  # shape=[N]
+        xy = x.mm(y.t())  # shape=[N, N]
+        d_xy = x2.unsqueeze(1).repeat(1, N) + y2.unsqueeze(0).repeat(N, 1) - 2 * xy
+        # d_xy[i][j]的元素是x[i]的平方和，加上y[j]的平方和，减去2倍的sum_{k} x[i][k]y[j][k]，因此
+        # d_xy[i][j]就是x[i]和y[j]相减，平方，求和
+        return torch.exp(- d_xy / (2 * sigma * sigma))
+    else:
+        raise NotImplementedError
+
+
+
+
+
+def set_threshold_margin(output_layer:neuron.BaseNode, label_one_hot:torch.Tensor,
+                         eval_threshold=1.0, threshold0=0.9, threshold1=1.1):
+    '''
+    :param output_layer: 用于分类的网络的输出层，输出层输出shape=[batch_size, C]
+    :param label_one_hot: one hot格式的样本标签，shape=[batch_size, C]
+    :param eval_threshold: 输出层神经元在测试（推理）时使用的电压阈值
+    :param threshold0: 输出层神经元在训练时，负样本的电压阈值
+    :param threshold1: 输出层神经元在训练时，正样本的电压阈值
+    :return: None
+
+    对于用来分类的网络，为输出层神经元的电压阈值设置一定的裕量，以获得更好的分类性能。
+
+    类别总数为C，网络的输出层共有C个神经元。网络在训练时，当输入真实类别为i的数据，输出层中第i个神经元的电压阈值会被设置成\\
+    threshold1，而其他神经元的电压阈值会被设置成threshold0。而在测试（推理）时，输出层中神经元的电压阈值被统一设置成eval_threshold。
+    '''
+    if output_layer.training:
+        output_layer.v_threshold = torch.ones_like(label_one_hot) * threshold0
+        output_layer.v_threshold[label_one_hot == 1] = threshold1
+    else:
+        output_layer.v_threshold = eval_threshold
+
+
+def redundant_one_hot(labels:torch.Tensor, num_classes:int, n:int):
+    '''
+    :param labels: shape=[batch_size]的tensor，表示batch_size个标签
+    :param num_classes: int，类别总数
+    :param n: 表示每个类别所用的编码数量
+    :return: shape=[batch_size, num_classes * n]的tensor
+
+    对数据进行冗余的one hot编码，每一类用n个1和(num_classes - 1) * n个0来编码。
+
+    示例：
+
+    .. code-block:: python
+
+        >>> num_classes = 3
+        >>> n = 2
+        >>> labels = torch.randint(0, num_classes, [4])
+        >>> labels
+        tensor([0, 1, 1, 0])
+        >>> codes = functional.redundant_one_hot(labels, num_classes, n)
+        >>> codes
+        tensor([[1., 1., 0., 0., 0., 0.],
+                [0., 0., 1., 1., 0., 0.],
+                [0., 0., 1., 1., 0., 0.],
+                [1., 1., 0., 0., 0., 0.]])
+
+    '''
+    redundant_classes = num_classes * n
+    codes = torch.zeros(size=[labels.shape[0], redundant_classes], device=labels.device)
+    for i in range(n):
+        codes += F.one_hot(labels * n + i, redundant_classes)
+    return codes
+
+def first_spike_index(spikes: torch.Tensor):
+    '''
+    :param spikes: shape=[*, T]，表示任意个神经元在t=0, 1, ..., T-1，共T个时刻的输出脉冲
+    :return: index, shape=[*, T]，为True的位置表示该神经元首次释放脉冲的时刻
+
+    输入任意个神经元的输出脉冲，返回一个与输入相同shape的bool类型的index。index为True的位置，表示该神经元首次释放脉冲的时刻。
+
+    示例：
+
+    .. code-block:: python
+
+        >>> spikes = (torch.rand(size=[2, 3, 8]) >= 0.8).float()
+        >>> spikes
+        tensor([[[0., 0., 0., 0., 0., 0., 0., 0.],
+         [1., 0., 0., 0., 0., 0., 1., 0.],
+         [0., 1., 0., 0., 0., 1., 0., 1.]],
+
+        [[0., 0., 1., 1., 0., 0., 0., 1.],
+         [1., 1., 0., 0., 1., 0., 0., 0.],
+         [0., 0., 0., 1., 0., 0., 0., 0.]]])
+        >>> first_spike_index(spikes)
+        tensor([[[False, False, False, False, False, False, False, False],
+         [ True, False, False, False, False, False, False, False],
+         [False,  True, False, False, False, False, False, False]],
+
+        [[False, False,  True, False, False, False, False, False],
+         [ True, False, False, False, False, False, False, False],
+         [False, False, False,  True, False, False, False, False]]])
+
+    '''
+    with torch.no_grad():
+        # 在时间维度上，2次cumsum后，元素为1的位置，即为首次发放脉冲的位置
+        return spikes.cumsum(dim=-1).cumsum(dim=-1) == 1
