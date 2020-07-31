@@ -1,23 +1,8 @@
-SpikingFlow package
-===================
-
-Subpackages
------------
+SpikingFlow APIs
+========================
 
 .. toctree::
-
-   SpikingFlow.connection
-   SpikingFlow.encoding
+   SpikingFlow.clock_driven
+   SpikingFlow.datasets
    SpikingFlow.event_driven
-   SpikingFlow.learning
-   SpikingFlow.neuron
-   SpikingFlow.simulating
-   SpikingFlow.softbp
-
-Module contents
----------------
-
-.. automodule:: SpikingFlow
-   :members:
-   :undoc-members:
-   :show-inheritance:
+   SpikingFlow.visualizing
