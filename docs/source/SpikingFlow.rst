@@ -6,3 +6,4 @@ SpikingFlow APIs
    SpikingFlow.datasets
    SpikingFlow.event_driven
    SpikingFlow.visualizing
+   SpikingFlow.ann2snn

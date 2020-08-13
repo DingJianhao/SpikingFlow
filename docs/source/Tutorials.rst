@@ -6,3 +6,4 @@
 
    tutorial.clock_driven
    tutorial.event_driven
+   tutorial.ann2snn
